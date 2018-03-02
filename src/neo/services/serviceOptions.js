@@ -9,6 +9,7 @@ export function serviceOptions(service, serviceName, initObj) {
         initObj = {};
     }
 
+    service.stopPolling = false;
     service.serviceLatency = 0;
     service.serviceLatencyStartTime = 0;
     service.serviceLastConnectedTime = Date.now();

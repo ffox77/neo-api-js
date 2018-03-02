@@ -30,6 +30,7 @@ function serviceOptions(service, serviceName, initObj) {
         initObj = {};
     }
 
+    service.stopPolling = false;
     service.serviceLatency = 0;
     service.serviceLatencyStartTime = 0;
     service.serviceLastConnectedTime = Date.now();
@@ -417,13 +418,14 @@ function PollRunner (policy) {
 
 function makeServiceRequest (restService, httpOptions) {
 
-    return _wrapPromise(function (resolve, reject, notify) {
+    return _wrapPromise(function (resolve, reject, notify, notifyCatch) {
 
         let ctx = prepareContext();
 
         ctx.successFunction = resolve;
         ctx.errorFunction = reject;
         ctx.notifyFunction = notify;
+        ctx.notifyCatchFunction = notifyCatch;
         ctx.transformResponse = httpOptions.transformResponse || noop;
         ctx.transformResponseError = httpOptions.transformResponseError || noop;
 
@@ -440,6 +442,10 @@ function makeServiceRequest (restService, httpOptions) {
 
         if (poll) {
             let pollRunner = service.getPollRunner(poll).addRequest(function () {
+                if (restService.stopPolling) {
+                    return Promise.reject('Service has been requested to stop polling');
+                }
+
                 return _makeServiceRequest(client, options, ctx);
             });
 
@@ -456,15 +462,18 @@ function noop () {}
 
 //Only top-level Promise has notify. This is intentional as then().notify() does not make any sense.
 //  Notify keeps the chain open indefinitely and can be called repeatedly.
-//  Once Then is called, the promise chain is considered resolved and marked for cleanup. Notify can never be called after a then.
+//  Once Then is called, the promise chain is considered resolved and marked for cleanup. Notify can never be called again.
+//  Same goes for Catch. Once Catch is called, the promise chain is considered resolved and marked for cleanup. notify or notifyCatch can never be called again.
 function _wrapPromise (callback) {
 
     let promise = new Promise(function (resolve, reject) {
-        callback(resolve, reject, handleNotify);
+        callback(resolve, reject, handleNotify, handleNotifyCatch);
     });
 
     promise._notify = noop;
+    promise._notifyCatch = noop;
     promise.notify = notify;
+    promise.notifyCatch = notifyCatch;
 
     function notify (fn) {
 
@@ -483,8 +492,29 @@ function _wrapPromise (callback) {
         return this;
     }
 
+    function notifyCatch (fn) {
+
+        if (promise._notifyCatch === noop) {
+            promise._notifyCatch = fn;
+        }
+        else {
+            //Support chaining notify calls: _notifyCatch()._notifyCatch()
+            let chainNotifyCatch = promise._notifyCatch;
+
+            promise._notifyCatch = function (result) {
+                return fn(chainNotifyCatch(result));
+            };
+        }
+
+        return this;
+    }
+
     function handleNotify (result) {
         promise._notify(result);
+    }
+
+    function handleNotifyCatch (result) {
+        promise._notifyCatch(result);
     }
 
     return promise;
@@ -508,7 +538,13 @@ function _makeServiceRequest (client, options, ctx) {
     let promise = client.invoke(options);
 
     promise.catch(function (response) {
-        ctx.errorFunction(response);
+
+        if (ctx.isPolling()) {
+            ctx.notifyCatchFunction(response);
+        }
+        else {
+            ctx.errorFunction(response);
+        }
 
         ctx.stopLatencyTimer(true);
     });
